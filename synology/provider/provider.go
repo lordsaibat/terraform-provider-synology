@@ -3,9 +3,12 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/appkins/terraform-provider-synology/synology/provider/container"
 	"github.com/appkins/terraform-provider-synology/synology/provider/core"
@@ -33,8 +36,10 @@ const (
 	SYNOLOGY_SKIP_CERT_CHECK_ENV_VAR = "SYNOLOGY_SKIP_CERT_CHECK"
 )
 
-// Ensure SynologyProvider satisfies various provider interfaces.
-var _ provider.Provider = &SynologyProvider{}
+var (
+	// Regex to match IP address with optional port
+	ipRegex = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}(:\d+)?$`)
+)
 
 // SynologyProvider defines the provider implementation.
 type SynologyProvider struct{}
@@ -50,15 +55,14 @@ type SynologyProviderModel struct {
 
 func (p *SynologyProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
 	resp.TypeName = "synology"
-
-	tflog.Info(ctx, "Starting")
+	tflog.Info(ctx, "Starting Synology Provider")
 }
 
 func (p *SynologyProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Attributes: map[string]schema.Attribute{
 			"host": schema.StringAttribute{
-				Description: "Remote Synology station host in form of 'host:port'.",
+				Description: "Remote Synology station host, IP, or IP:port.",
 				Optional:    true,
 			},
 			"user": schema.StringAttribute{
@@ -90,12 +94,25 @@ func (p *SynologyProvider) Configure(ctx context.Context, req provider.Configure
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
 	host := data.Host.ValueString()
 	if host == "" {
 		if v := os.Getenv(SYNOLOGY_HOST_ENV_VAR); v != "" {
 			host = v
 		}
 	}
+
+	// Validate and format the host
+	host, err := formatHost(host)
+	if err != nil {
+		resp.Diagnostics.Append(diag.NewAttributeErrorDiagnostic(
+			path.Root("host"),
+			"Invalid provider configuration",
+			fmt.Sprintf("Invalid host format: %s", err),
+		))
+		return
+	}
+
 	user := data.User.ValueString()
 	if user == "" {
 		if v := os.Getenv(SYNOLOGY_USER_ENV_VAR); v != "" {
@@ -108,113 +125,76 @@ func (p *SynologyProvider) Configure(ctx context.Context, req provider.Configure
 			password = v
 		}
 	}
-	otp_secret := data.OtpSecret.ValueString()
-	if otp_secret == "" {
+	otpSecret := data.OtpSecret.ValueString()
+	if otpSecret == "" {
 		if v := os.Getenv(SYNOLOGY_OTP_SECRET_ENV_VAR); v != "" {
-			otp_secret = v
+			otpSecret = v
 		}
 	}
 
-	skipCertificateCheck := data.SkipCertCheck.ValueBool()
-	if vString := os.Getenv(SYNOLOGY_SKIP_CERT_CHECK_ENV_VAR); vString != "" {
-		if v, err := strconv.ParseBool(vString); err == nil {
-			skipCertificateCheck = v
+	skipCertCheck := data.SkipCertCheck.ValueBool()
+	if v := os.Getenv(SYNOLOGY_SKIP_CERT_CHECK_ENV_VAR); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			skipCertCheck = parsed
 		}
 	}
 
-	if host == "" {
-		resp.Diagnostics.Append(diag.NewAttributeErrorDiagnostic(
-			path.Root("host"),
-			"invalid provider configuration",
-			"host information is not provided"))
-	}
-	if user == "" {
-		resp.Diagnostics.Append(diag.NewAttributeErrorDiagnostic(
-			path.Root("user"),
-			"invalid provider configuration",
-			"user information is not provided"))
-	}
-	if password == "" {
-		resp.Diagnostics.Append(diag.NewAttributeErrorDiagnostic(
-			path.Root("password"),
-			"invalid provider configuration",
-			"password information is not provided"))
-	}
-
-	if resp.Diagnostics.HasError() {
+	c, err := client.New(api.Options{
+		Host:       host,
+		VerifyCert: !skipCertCheck,
+	})
+	if err != nil {
+		resp.Diagnostics.Append(diag.NewErrorDiagnostic("Synology client creation failed", fmt.Sprintf("Unable to create Synology client, got error: %v", err)))
 		return
 	}
 
-	// Example client configuration for data sources and resources
-	c, err := client.New(api.Options{
-		Host:       host,
-		VerifyCert: !skipCertificateCheck,
-		//Logger: 	 tflog.(ctx),
-	})
-	if err != nil {
-		resp.Diagnostics.Append(diag.NewErrorDiagnostic("synology client creation failed", fmt.Sprintf("Unable to create Synology client, got error: %v", err)))
-	}
-
-	if _, err := c.Login(ctx, user, password, otp_secret); err != nil {
-		resp.Diagnostics.Append(diag.NewErrorDiagnostic("login to Synology station failed", fmt.Sprintf("Unable to login to Synology station, got error: %s", err)))
+	if _, err := c.Login(ctx, user, password, otpSecret); err != nil {
+		resp.Diagnostics.Append(diag.NewErrorDiagnostic("Login to Synology station failed", fmt.Sprintf("Unable to login to Synology station, got error: %s", err)))
 	}
 
 	resp.DataSourceData = c
 	resp.ResourceData = c
 }
 
-func (p *SynologyProvider) Resources(ctx context.Context) []func() resource.Resource {
-
-	var resp []func() resource.Resource
-
-	resp = append(resp, NewApiResource, NewPasswordResource)
-	resp = append(resp, core.Resources()...)
-	resp = append(resp, filestation.Resources()...)
-	resp = append(resp, virtualization.Resources()...)
-	resp = append(resp, container.Resources()...)
-
-	return resp
-}
-
-func (p *SynologyProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
-
-	var resp []func() datasource.DataSource
-
-	resp = append(resp, core.DataSources()...)
-	resp = append(resp, filestation.DataSources()...)
-	resp = append(resp, virtualization.DataSources()...)
-	resp = append(resp, container.DataSources()...)
-
-	return resp
-}
-
-func (p *SynologyProvider) Functions(ctx context.Context) []func() function.Function {
-	return []func() function.Function{
-		NewISOFunction,
-		NewMkPasswdFunction,
+// formatHost validates and formats the host value.
+func formatHost(host string) (string, error) {
+	// Check if it's a valid IP with optional port
+	if ipRegex.MatchString(host) {
+		if !strings.Contains(host, ":") {
+			// Add default port if no port specified
+			host = host + ":5000"
+		}
+		return "http://" + host, nil
 	}
+
+	// Attempt to parse as a URL
+	parsedURL, err := url.Parse(host)
+	if err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" {
+		return host, nil
+	}
+
+	// Attempt to resolve as a hostname
+	if _, err := net.LookupHost(host); err == nil {
+		return "http://" + host, nil
+	}
+
+	return "", fmt.Errorf("host must be a valid IP, hostname, or URL")
 }
 
 func (p *SynologyProvider) ValidateConfig(ctx context.Context, req provider.ValidateConfigRequest, resp *provider.ValidateConfigResponse) {
 	var data SynologyProviderModel
 
 	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
-
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if _, err := url.Parse(data.Host.ValueString()); err != nil {
+	host := data.Host.ValueString()
+	if _, err := formatHost(host); err != nil {
 		resp.Diagnostics.Append(diag.NewAttributeErrorDiagnostic(
 			path.Root("host"),
-			"invalid provider configuration",
-			"host is not a valid URL"))
-		return
-	}
-}
-
-func New() func() provider.Provider {
-	return func() provider.Provider {
-		return &SynologyProvider{}
+			"Invalid provider configuration",
+			"Host must be a valid IP, hostname, or URL with an optional port (default port 5000 will be used if none specified)",
+		))
 	}
 }
